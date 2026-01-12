@@ -1,3 +1,5 @@
+# Storage for variables taken from:
+# https://community.home-assistant.io/t/trigger-based-template-sensor-to-store-global-variables/735474
 template:
 - trigger:
     - platform: event
