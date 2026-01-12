@@ -1,0 +1,205 @@
+template:
+- trigger:
+    - platform: event
+      event_type: set_skive_vand_variable
+  condition:
+    - condition: template
+      value_template: >
+        {{
+          trigger.event.event_type == 'set_skive_vand_variable'
+          and trigger.event.data is defined
+          and trigger.event.data.key is defined
+          and trigger.event.data.value is defined
+        }}
+  action:
+    - if: "{{ trigger.event.data.get('log', state_attr('sensor.skive_vand_variables', 'log_events')) }}"
+      then:
+        - service: logbook.log
+          data:
+            name: "{{ trigger.event.event_type }}:"
+            message: >
+              {{ trigger.event.data.key }}: {{ trigger.event.data.value }}.
+  sensor:
+    - unique_id: skive_vand_variables
+      name: skive_vand_variables
+      state: skive_vand_variables
+      attributes:
+        default_timestamp: false
+        log_events: true
+        variables: >
+          {% set others = dict(this.attributes.get('variables', {}).items() | rejectattr('0', 'eq', trigger.event.data.key)) %}
+          {% if trigger.event.event_type == 'set_skive_vand_variable'
+              and trigger.event.data.get('set_timestamp', this.attributes.get('default_timestamp', false))
+          %}
+            {% set value  = trigger.event.data.value %}
+            {% set value = value.isoformat() if value is datetime else value %}
+            {% set new = {trigger.event.data.key: {'value': value, 'timestamp': now().timestamp()}} %}
+            {{ dict(others, **new) }}
+          {% elif trigger.event.event_type == 'set_skive_vand_variable' %}
+            {% set new = {trigger.event.data.key: trigger.event.data.value} %}
+            {{ dict(others, **new) }}
+          {% endif %}
+- trigger:
+    - platform: event
+      event_type: set_skive_vand_leakage_alarm
+  binary_sensor:
+    - name: "Leakage alarm"
+      state: "{{ state_attr('sensor.skive_vand_variables', 'variables').skive_vand_leakage_alarm }}"
+      unique_id: skive_vand_leakage_alarm
+      device_class: moisture
+- trigger:
+    - platform: event
+      event_type: set_skive_vand_burst_alarm
+  binary_sensor:
+    - name: "Burst alarm"
+      state: "{{ state_attr('sensor.skive_vand_variables', 'variables').skive_vand_burst_alarm }}"
+      unique_id: skive_vand_burst_alarm
+      device_class: moisture
+- trigger:
+    - platform: event
+      event_type: set_skive_vand_water_volume
+  sensor:
+    - name: "Water volume"
+      state: "{{ state_attr('sensor.skive_vand_variables', 'variables').skive_vand_water_volume }}"
+      unique_id: skive_vand_water_volume
+      unit_of_measurement: m³
+      device_class: water
+      state_class: total
+- trigger:
+    - platform: event
+      event_type: set_skive_vand_water_volume_backflow
+  sensor:
+    - name: "Water volume backflow"
+      state: "{{ state_attr('sensor.skive_vand_variables', 'variables').skive_vand_water_volume_backflow }}"
+      unique_id: skive_vand_water_volume_backflow
+      unit_of_measurement: m³
+      device_class: water
+      state_class: total
+- trigger:
+    - platform: event
+      event_type: set_skive_vand_water_temperature
+  sensor:
+    - name: "Water temperature"
+      state: "{{ state_attr('sensor.skive_vand_variables', 'variables').skive_vand_water_temperature }}"
+      unique_id: skive_vand_water_temperature
+      unit_of_measurement: °C
+      device_class: temperature
+      state_class: measurement
+
+automation:
+- id: skive_vand
+  alias: "Skive vand"
+  trace:
+    stored_traces: 10
+  mode: single
+  triggers:
+  - trigger: time_pattern
+    hours: "*"
+    minutes: "/5"
+    seconds: "0"
+  variables:
+    skive_vand_username: !secret skive_vand_username
+    skive_vand_password: !secret skive_vand_password
+  actions:
+  - if: >
+      {{
+        (state_attr('sensor.skive_vand_variables', 'variables') is none)
+        or (state_attr('sensor.skive_vand_variables', 'variables').skive_vand_bearer_token is none)
+        or (state_attr('sensor.skive_vand_variables', 'variables').skive_vand_bearer_expires is none)
+        or ((now().timestamp() - state_attr('sensor.skive_vand_variables', 'variables').skive_vand_bearer_token.timestamp)
+            > (state_attr('sensor.skive_vand_variables', 'variables').skive_vand_bearer_expires / 2))
+      }}
+    then:
+      - action: rest_command.skive_vand_login
+        data:
+          username: "{{ skive_vand_username }}"
+          password: "{{ skive_vand_password }}"
+        response_variable: rsp
+      - if: "{{ rsp['status'] == 200 }}"
+        then:
+          - event: set_skive_vand_variable
+            event_data:
+              key: "skive_vand_bearer_token"
+              value: "{{ rsp['content']['AuthToken'] }}"
+              set_timestamp: true
+          - event: set_skive_vand_variable
+            event_data:
+              key: "skive_vand_bearer_expires"
+              value: "{{ rsp['content']['ExpiresIn'] }}"
+  - if: >
+      {{
+        state_attr('sensor.skive_vand_variables', 'variables') is defined
+        and state_attr('sensor.skive_vand_variables', 'variables').skive_vand_bearer_token is defined
+      }}
+    then:
+      - action: rest_command.skive_vand_customer
+        data:
+          bearer_token: "{{ state_attr('sensor.skive_vand_variables', 'variables').skive_vand_bearer_token.value }}"
+        response_variable: rsp
+      - if: "{{ rsp['status'] == 200 }}"
+        then:
+          - event: set_skive_vand_variable
+            event_data:
+              key: "skive_vand_device_id"
+              value: "{{ rsp['content'].Locations[0].Devices[0].Id }}"
+          - event: set_skive_vand_variable
+            event_data:
+              key: "skive_vand_leakage_alarm"
+              value: "{{ is_state('Leakage', rsp['content'].Locations[0].Devices[0].ActiveAlarms|from_json('')) }}"
+          - event: set_skive_vand_leakage_alarm
+          - event: set_skive_vand_variable
+            event_data:
+              key: "skive_vand_burst_alarm"
+              value: "{{ is_state('Burst', rsp['content'].Locations[0].Devices[0].ActiveAlarms|from_json('')) }}"
+          - event: set_skive_vand_burst_alarm
+  - if: >
+      {{
+          state_attr('sensor.skive_vand_variables', 'variables') is defined
+          and state_attr('sensor.skive_vand_variables', 'variables').skive_vand_bearer_token is defined
+          and state_attr('sensor.skive_vand_variables', 'variables').skive_vand_device_id is defined
+      }}
+    then:
+      - action: rest_command.skive_vand_readings
+        data:
+          bearer_token: "{{ state_attr('sensor.skive_vand_variables', 'variables').skive_vand_bearer_token.value }}"
+          device_id: "{{ state_attr('sensor.skive_vand_variables', 'variables').skive_vand_device_id }}"
+        response_variable: rsp
+      - if: "{{ rsp['status'] == 200 }}"
+        then:
+          - event: set_skive_vand_variable
+            event_data:
+              key: "skive_vand_water_volume"
+              value: "{{ rsp['content'][0].Readings[0].Value }}"
+          - event: set_skive_vand_water_volume
+          - event: set_skive_vand_variable
+            event_data:
+              key: "skive_vand_water_temperature"
+              value: "{{ rsp['content'][0].Readings[1].Value }}"
+          - event: set_skive_vand_water_temperature
+          - event: set_skive_vand_variable
+            event_data:
+              key: "skive_vand_water_volume_backflow"
+              value: "{{ rsp['content'][0].Readings[2].Value }}"
+          - event: set_skive_vand_water_volume_backflow
+
+rest_command:
+  skive_vand_login:
+    url: "https://skivevand.bdforsyning.dk/api/Customer/login"
+    method: POST
+    content_type: "application/json"
+    payload: '{"MatchTag":null,"Email":"{{ username }}","Password":"{{ password }}"}'
+
+  skive_vand_customer:
+    url: "https://skivevand.bdforsyning.dk/api/Customer"
+    method: GET
+    content_type: "application/json"
+    headers:
+      Authorization: "Bearer {{ bearer_token }}"
+      
+  skive_vand_readings:
+    url: "https://skivevand.bdforsyning.dk/api/Stats/readings/devices"
+    method: POST
+    content_type: "application/json"
+    headers:
+      Authorization: "Bearer {{ bearer_token }}"
+    payload: '{"DeviceContainerIds":["{{ device_id }}"],"QuantityTypes":["WaterVolume","WaterTemperature","WaterVolumeBackflow"],"Size":1}'
